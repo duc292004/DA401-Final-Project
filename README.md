@@ -33,8 +33,6 @@ The repository is organized as follows:
 - `data/`
   - Iowa liquor sales data file
   - FRED macroeconomic data file
-- `paper/`
-  - 
 - `code/`
   - R script file used for the analysis
 
