@@ -1,0 +1,988 @@
+---
+title: "Final Project DA401"
+author: "Duc Ngo"
+institute: "Denison University"
+format: 
+  html:
+    theme: lux # Check here for more themes: https://quarto.org/docs/output-formats/html-themes.html
+    code-tools: true
+    code-fold: true
+    code-summary: "Code"
+    code-copy: hover
+    link-external-newwindow: true
+    tbl-cap-location: top
+    fig-cap-location: bottom
+    toc: true
+    toc-depth: 3 
+    toc-location: left
+    number-sections: true 
+
+self-contained: true
+editor: source
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(fig.align = 'center')
+knitr::opts_chunk$set(out.width = '90%')
+knitr::opts_chunk$set(results = 'hold')
+knitr::opts_chunk$set(fig.show = 'hold')
+knitr::opts_chunk$set(error = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+par(mar = c(4.1, 4.1, 1.1, 4.1))
+
+hooks = knitr::knit_hooks$get()
+hook_foldable = function(type) {
+  force(type)
+  function(x, options) {
+    res = hooks[[type]](x, options)
+    
+    if (isFALSE(options[[paste0("fold.", type)]])) return(res)
+    
+    paste0(
+      "<details open><summary>", gsub("^p", "P", gsub("^o", "O", type)), "</summary>\n\n",
+      res,
+      "\n\n</details>"
+    )
+  }
+}
+
+knitr::knit_hooks$set(
+  output = hook_foldable("output"),
+  plot = hook_foldable("plot")
+)
+
+Q <- 0
+```
+
+## Set up
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(glmnet)
+library(randomForest)
+library(forecast)
+library(knitr)
+
+# File paths
+iowa_file <- "D:/Iowa_Liquor_Sales_20260209.csv"
+fred_file <- "D:/FRED_data/FRED data.csv"
+
+clean_names_simple <- function(x) {
+  x <- gsub("([a-z0-9])([A-Z])", "\\1_\\2", x, perl = TRUE)
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  x <- tolower(x)
+  x <- gsub("^_+|_+$", "", x)
+  x <- gsub("_+", "_", x)
+  x
+}
+
+# Load raw data
+sales_raw <- read_csv(iowa_file, show_col_types = FALSE)
+fred_raw  <- read_csv(fred_file, show_col_types = FALSE)
+
+# Clean column names
+names(sales_raw) <- clean_names_simple(names(sales_raw))
+names(fred_raw)  <- clean_names_simple(names(fred_raw))
+
+dim(sales_raw)
+dim(fred_raw)
+
+names(sales_raw)
+names(fred_raw)
+
+head(sales_raw)
+head(fred_raw)
+
+
+```
+
+## Data Cleaning and Processing
+
+```{r}
+
+sales_clean <- sales_raw %>%
+  mutate(
+    date = mdy(date),
+    store_id = store_name,
+    city = str_to_upper(city),
+    bottles_sold = parse_number(as.character(bottles_sold)),
+    sale_dollars = parse_number(as.character(sale_dollars))
+  ) %>%
+  filter(year(date) >= 2021, year(date) <= 2025)
+
+fred_clean <- fred_raw %>%
+  mutate(
+    observation_date = as.Date(observation_date)
+  ) %>%
+  arrange(observation_date)
+
+dim(sales_clean)
+dim(fred_clean)
+
+summary(sales_clean$bottles_sold)
+summary(sales_clean$sale_dollars)
+
+colSums(is.na(sales_clean))
+colSums(is.na(fred_clean))
+
+head(sales_clean)
+head(fred_clean)
+
+class(fred_raw$observation_date)
+head(fred_raw$observation_date)
+```
+
+## Weekly Aggregation
+
+```{r}
+weekly_sales <- sales_clean %>%
+  filter(!is.na(city), !is.na(bottles_sold)) %>%
+  filter(bottles_sold >= 0, sale_dollars >= 0) %>%
+  mutate(
+    week_start = floor_date(date, unit = "week", week_start = 1)
+  ) %>%
+  group_by(store_id, store_name, city, week_start) %>%
+  summarise(
+    weekly_bottles = sum(bottles_sold, na.rm = TRUE),
+    weekly_sales = sum(sale_dollars, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+dim(weekly_sales)
+summary(weekly_sales$weekly_bottles)
+summary(weekly_sales$weekly_sales)
+head(weekly_sales)
+
+```
+
+## Merge Weekly Sales with FRED Data
+
+```{r}
+fred_weekly <- fred_clean %>%
+  arrange(observation_date) %>%
+  mutate(
+    across(-observation_date, ~ zoo::na.locf(.x, na.rm = FALSE)),
+    across(-observation_date, ~ zoo::na.locf(.x, fromLast = TRUE, na.rm = FALSE))
+  )
+
+model_df <- weekly_sales %>%
+  mutate(
+    month_start = floor_date(week_start, unit = "month")
+  ) %>%
+  left_join(
+    fred_weekly,
+    by = c("month_start" = "observation_date")
+  )
+
+# Quick check
+dim(model_df)
+head(model_df)
+
+colSums(is.na(model_df))
+
+```
+
+## Feature Engineering
+
+```{r}
+# Urban vs Rural
+urban_cities <- c(
+  "DES MOINES", "CEDAR RAPIDS", "DAVENPORT", "SIOUX CITY", "IOWA CITY",
+  "WATERLOO", "AMES", "WEST DES MOINES", "ANKENY", "COUNCIL BLUFFS",
+  "DUBUQUE", "MARION", "BETTENDORF", "MUSCATINE", "BURLINGTON"
+)
+
+# Holiday weeks
+holiday_dates <- as.Date(c(
+  "2021-01-01", "2021-07-04", "2021-11-25", "2021-12-25",
+  "2022-01-01", "2022-07-04", "2022-11-24", "2022-12-25",
+  "2023-01-01", "2023-07-04", "2023-11-23", "2023-12-25",
+  "2024-01-01", "2024-07-04", "2024-11-28", "2024-12-25",
+  "2025-01-01", "2025-07-04", "2025-11-27", "2025-12-25"
+))
+
+holiday_weeks <- floor_date(holiday_dates, unit = "week", week_start = 1)
+
+model_df <- model_df %>%
+  mutate(
+    store_type = if_else(city %in% urban_cities, "Urban", "Rural"),
+    is_holiday = if_else(week_start %in% holiday_weeks, 1, 0),
+    year = year(week_start),
+    month = factor(month.abb[month(week_start)], levels = month.abb),
+    week_of_year = isoweek(week_start)
+  ) %>%
+  arrange(store_id, week_start) %>%   # CHANGED: make time ordering explicit
+  group_by(store_id) %>%
+  mutate(
+    demand_lag1 = lag(weekly_bottles, 1),
+    demand_lag2 = lag(weekly_bottles, 2),
+    demand_lag4 = lag(weekly_bottles, 4),
+    demand_lag12 = lag(weekly_bottles, 12),
+    rolling_mean_4 = lag(zoo::rollmean(weekly_bottles, k = 4, fill = NA, align = "right"), 1)
+  ) %>%
+  ungroup()
+
+dim(model_df)
+head(model_df)
+
+colSums(is.na(model_df))
+
+```
+
+## Final Model Dataset
+
+```{r}
+
+model_final <- model_df %>%
+  drop_na(demand_lag1, demand_lag2, demand_lag4, demand_lag12, rolling_mean_4)
+
+common_test_keys <- model_final %>%
+  filter(year == 2025) %>%
+  distinct(store_id, week_start)
+
+eligible_stores <- common_test_keys %>%
+  distinct(store_id) %>%
+  pull(store_id)
+
+nrow(common_test_keys)
+length(eligible_stores)
+
+dim(model_final)
+head(model_final)
+
+colSums(is.na(model_final))
+
+summary(model_final$weekly_bottles)
+summary(model_final$weekly_sales)
+
+```
+
+## Exploratory Data Analysis
+
+```{r}
+# EDA dataset from weekly sales
+eda_df <- weekly_sales %>%
+  mutate(
+    store_type = if_else(city %in% urban_cities, "Urban", "Rural"),
+    year = year(week_start)
+  ) %>%
+  filter(week_start >= as.Date("2021-01-04"))
+
+# Table 1: Descriptive statistics by year and store type
+desc_table <- eda_df %>%
+  group_by(year, store_type) %>%
+  summarise(
+    mean_weekly_bottles = mean(weekly_bottles, na.rm = TRUE),
+    median_weekly_bottles = median(weekly_bottles, na.rm = TRUE),
+    sd_weekly_bottles = sd(weekly_bottles, na.rm = TRUE),
+    mean_weekly_sales = mean(weekly_sales, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+desc_table
+
+```
+
+```{r}
+# Figure 1: Total weekly liquor bottles sold
+eda_df %>%
+  group_by(week_start) %>%
+  summarise(
+    total_weekly_bottles = sum(weekly_bottles, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = week_start, y = total_weekly_bottles)) +
+  geom_line(color = "steelblue") +
+  labs(
+    title = "Figure 1: Total Weekly Liquor Bottles Sold",
+    x = "Week",
+    y = "Total Weekly Bottles"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Figure 2: Weekly bottles sold by store type
+eda_df %>%
+  group_by(week_start, store_type) %>%
+  summarise(
+    total_weekly_bottles = sum(weekly_bottles, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = week_start, y = total_weekly_bottles, color = store_type)) +
+  geom_line() +
+  labs(
+    title = "Figure 2: Weekly Bottles Sold by Store Type",
+    x = "Week",
+    y = "Total Weekly Bottles"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Figure 3: Correlation heatmap for model variables
+corr_data <- model_final %>%
+  select(
+    weekly_bottles,
+    demand_lag1,
+    demand_lag2,
+    demand_lag4,
+    demand_lag12,
+    rolling_mean_4,
+    cpiaucsl,
+    dspic96,
+    iaur,
+    mrtssm4453_usn,
+    payems,
+    psavert,
+    rsnsr,
+    umcsent,
+    unrate
+  )
+
+corr_mat <- cor(corr_data, use = "pairwise.complete.obs")
+
+corr_df <- as.data.frame(corr_mat) %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "corr")
+
+ggplot(corr_df, aes(x = var1, y = var2, fill = corr)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "firebrick", mid = "white", high = "steelblue", midpoint = 0) +
+  labs(
+    title = "Figure 3: Correlation Heatmap",
+    x = "",
+    y = "",
+    fill = "Correlation"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Model 1: ARIMA Baseline
+
+```{r}
+# Create ARIMA train/test data from weekly sales
+arima_train <- weekly_sales %>%
+  filter(
+    store_id %in% eligible_stores,
+    year(week_start) >= 2021,
+    year(week_start) <= 2024
+  )
+
+arima_test <- weekly_sales %>%
+  filter(
+    store_id %in% eligible_stores,
+    year(week_start) == 2025
+  )
+
+dim(arima_train)
+dim(arima_test)
+```
+
+```{r}
+library(forecast)
+
+store_list <- sort(unique(eligible_stores))
+arima_pred_list <- list()
+
+for (sid in store_list) {
+  
+  train_store <- arima_train %>%
+    filter(store_id == sid) %>%
+    arrange(week_start)
+  
+  test_store <- arima_test %>%
+    filter(store_id == sid) %>%
+    arrange(week_start)
+  
+  if (nrow(train_store) < 20 || nrow(test_store) == 0) next
+  
+  y_train_store <- train_store$weekly_bottles
+  
+  fit_arima <- tryCatch(
+    auto.arima(
+      y_train_store,
+      seasonal = FALSE,
+      stepwise = TRUE,
+      approximation = TRUE
+    ),
+    error = function(e) NULL
+  )
+  
+  pred_store <- tryCatch(
+    {
+      if (is.null(fit_arima)) {
+        rep(mean(y_train_store, na.rm = TRUE), nrow(test_store))
+      } else {
+        as.numeric(forecast(fit_arima, h = nrow(test_store))$mean)
+      }
+    },
+    error = function(e) rep(mean(y_train_store, na.rm = TRUE), nrow(test_store))
+  )
+  
+  arima_pred_list[[sid]] <- tibble(
+    store_id = sid,
+    week_start = test_store$week_start,
+    actual = test_store$weekly_bottles,
+    pred_arima = pmax(pred_store, 0)
+  )
+}
+
+```
+
+
+```{r}
+# Combine predictions
+arima_results <- bind_rows(arima_pred_list) %>%
+  semi_join(common_test_keys, by = c("store_id", "week_start"))
+
+dim(arima_results)
+head(arima_results)
+
+
+
+```
+
+
+```{r}
+# Test RMSE
+rmse_arima <- sqrt(mean((arima_results$actual - arima_results$pred_arima)^2, na.rm = TRUE))
+rmse_arima
+
+
+```
+
+
+```{r}
+# Test MAE
+mae_arima <- mean(abs(arima_results$actual - arima_results$pred_arima), na.rm = TRUE)
+mae_arima
+
+```
+
+```{r}
+# Plot actual vs predicted totals in 2025
+arima_results %>%
+  group_by(week_start) %>%
+  summarise(
+    actual = sum(actual, na.rm = TRUE),
+    pred_arima = sum(pred_arima, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-week_start, names_to = "series", values_to = "value") %>%
+  ggplot(aes(x = week_start, y = value, color = series)) +
+  geom_line() +
+  labs(
+    title = "Figure 4: ARIMA: Actual vs Predicted Weekly Demand in 2025",
+    x = "Week",
+    y = "Total Weekly Bottles"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+
+## Data Partitioning
+
+```{r}
+library(caret)
+
+# Make sure factors are coded correctly
+model_final <- model_final %>%
+  mutate(
+    store_type = factor(store_type),
+    month = factor(month, levels = month.abb)
+  )
+
+# Time-based train/test split
+train_data <- model_final %>%
+  filter(year >= 2021, year <= 2024)
+
+test_data <- model_final %>%
+  filter(year == 2025)
+
+dim(train_data)
+dim(test_data)
+
+table(train_data$year)
+table(test_data$year)
+
+stopifnot(max(train_data$week_start) < min(test_data$week_start))
+stopifnot(
+  nrow(test_data %>% distinct(store_id, week_start)) ==
+    nrow(common_test_keys)
+)
+
+```
+
+
+
+```{r}
+# Create x and y for regularization models
+x_train <- model.matrix(
+  weekly_bottles ~ store_type + month + week_of_year + is_holiday +
+    demand_lag1 + demand_lag2 + demand_lag4 + demand_lag12 + rolling_mean_4 +
+    cpiaucsl + cusr0000_saf112 + cusr0000_saf116 + dspic96 + iaur +
+    mrtssm4453_usn + payems + psavert + rsnsr + umcsent + unrate,
+  data = train_data
+)[, -1]
+
+y_train <- train_data$weekly_bottles
+
+x_test <- model.matrix(
+  weekly_bottles ~ store_type + month + week_of_year + is_holiday +
+    demand_lag1 + demand_lag2 + demand_lag4 + demand_lag12 + rolling_mean_4 +
+    cpiaucsl + cusr0000_saf112 + cusr0000_saf116 + dspic96 + iaur +
+    mrtssm4453_usn + payems + psavert + rsnsr + umcsent + unrate,
+  data = test_data
+)[, -1]
+
+y_test <- test_data$weekly_bottles
+
+dim(x_train)
+dim(x_test)
+
+length(y_train)
+length(y_test)
+
+```
+
+```{r}
+## Model 2: Lasso Regression
+
+library(glmnet)
+
+set.seed(123)
+
+# Cross-validation to choose lambda
+cv_lasso <- cv.glmnet(
+  x_train,
+  y_train,
+  alpha = 1
+)
+
+# Best lambda
+best_lam_lasso <- cv_lasso$lambda.min
+best_lam_lasso
+
+# Plot CV curve
+plot(cv_lasso)
+
+```
+
+
+```{r}
+
+# Fit lasso model on the full training set using best lambda
+lasso_fit <- glmnet(
+  x_train,
+  y_train,
+  alpha = 1,
+  lambda = best_lam_lasso
+)
+
+# Predict on test set
+lasso_pred <- predict(
+  lasso_fit,
+  s = best_lam_lasso,
+  newx = x_test
+)
+
+# Test MSE
+lasso_mse <- mean((y_test - lasso_pred)^2)
+lasso_mse
+
+```
+
+```{r}
+# Test RMSE
+rmse_lasso <- sqrt(mean((y_test - lasso_pred)^2))
+rmse_lasso
+
+# Test MAE
+mae_lasso <- mean(abs(y_test - lasso_pred))
+mae_lasso
+
+# Coefficients
+coef(lasso_fit)
+```
+
+```{r}
+# Put coefficients into a cleaner table
+lasso_coef <- as.matrix(coef(lasso_fit)) %>%
+  as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  rename(coefficient = s0) %>%
+  arrange(desc(abs(coefficient)))
+
+head(lasso_coef, 20)
+
+```
+
+```{r}
+# Simple results table
+lasso_results <- data.frame(
+  Model = "Lasso",
+  MSE = lasso_mse,
+  RMSE = rmse_lasso,
+  MAE = mae_lasso,
+  Best_Lambda = best_lam_lasso
+)
+
+lasso_results
+
+```
+
+## Model 3: Random Forest
+
+```{r}
+library(randomForest)
+
+set.seed(123)
+
+# Sample training data for faster random forest
+train_rf <- train_data %>%
+  sample_n(20000)
+
+# Smaller tuning grid
+mtry_grid <- c(4, 8)
+
+rf_tuning <- data.frame(
+  mtry = mtry_grid,
+  oob_mse = NA
+)
+
+for (i in 1:length(mtry_grid)) {
+  
+  rf_temp <- randomForest(
+    weekly_bottles ~ store_type + month + week_of_year + is_holiday +
+      demand_lag1 + demand_lag2 + demand_lag4 + demand_lag12 + rolling_mean_4 +
+      cpiaucsl + cusr0000_saf112 + cusr0000_saf116 + dspic96 + iaur +
+      mrtssm4453_usn + payems + psavert + rsnsr + umcsent + unrate,
+    data = train_rf,
+    ntree = 20,
+    mtry = mtry_grid[i],
+    importance = FALSE
+  )
+  
+  rf_tuning$oob_mse[i] <- tail(rf_temp$mse, 1)
+}
+
+rf_tuning
+
+best_mtry <- rf_tuning$mtry[which.min(rf_tuning$oob_mse)]
+best_mtry
+
+# Final random forest model
+rf_fit <- randomForest(
+  weekly_bottles ~ store_type + month + week_of_year + is_holiday +
+    demand_lag1 + demand_lag2 + demand_lag4 + demand_lag12 + rolling_mean_4 +
+    cpiaucsl + cusr0000_saf112 + cusr0000_saf116 + dspic96 + iaur +
+    mrtssm4453_usn + payems + psavert + rsnsr + umcsent + unrate,
+  data = train_rf,
+  ntree = 50,
+  mtry = best_mtry,
+  importance = TRUE
+)
+
+rf_fit
+
+# Predict on test set
+rf_pred <- predict(rf_fit, newdata = test_data)
+
+rf_mse <- mean((y_test - rf_pred)^2)
+rmse_rf <- sqrt(mean((y_test - rf_pred)^2))
+mae_rf <- mean(abs(y_test - rf_pred))
+
+rf_results <- data.frame(
+  Model = "Random Forest",
+  MSE = rf_mse,
+  RMSE = rmse_rf,
+  MAE = mae_rf,
+  Best_mtry = best_mtry
+)
+
+rf_results
+
+# Variable importance
+importance(rf_fit)
+varImpPlot(rf_fit)
+
+
+```
+
+```{r}
+
+
+
+library(tidyverse)
+
+# 1. Get permutation importance from random forest
+rf_imp <- importance(rf_fit, type = 1) %>%
+  as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  rename(perm_importance = `%IncMSE`) %>%
+  arrange(desc(perm_importance))
+
+# 2. Rename variables for plotting
+rf_imp <- rf_imp %>%
+  mutate(
+    variable_label = recode(
+      variable,
+      demand_lag1 = "Demand lag (1 week)",
+      demand_lag2 = "Demand lag (2 weeks)",
+      demand_lag4 = "Demand lag (4 weeks)",
+      demand_lag12 = "Demand lag (12 weeks)",
+      rolling_mean_4 = "Rolling mean (4 weeks)",
+      cpiaucsl = "CPI",
+      cusr0000_saf112 = "Alcohol CPI 1",
+      cusr0000_saf116 = "Alcohol CPI 2",
+      dspic96 = "Real disposable income",
+      iaur = "Iowa unemployment rate",
+      mrtssm4453_usn = "Liquor retail sales",
+      payems = "Total employment",
+      psavert = "Personal saving rate",
+      rsnsr = "Recession indicator",
+      umcsent = "Consumer sentiment",
+      unrate = "Unemployment rate",
+      week_of_year = "Week of year",
+      store_type = "Store type",
+      month = "Month",
+      is_holiday = "Holiday week"
+    )
+  )
+
+# 3. Keep top 10 predictors and highlight top 5
+rf_top10 <- rf_imp %>%
+  slice(1:10) %>%
+  mutate(
+    highlight = if_else(row_number() <= 5, "Top 5", "Other"),
+    variable_label = factor(variable_label, levels = rev(variable_label))
+  )
+
+# 4. Plot
+ggplot(rf_top10, aes(x = perm_importance, y = variable_label, fill = highlight)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = round(perm_importance, 1)), hjust = -0.15, size = 4) +
+  scale_fill_manual(values = c("Top 5" = "#aa2b1e", "Other" = "grey60")) +
+  labs(
+    title = "Random Forest: Top 10 Predictors",
+    x = "% Increase in MSE when feature is permuted",
+    y = NULL
+  ) +
+  coord_cartesian(xlim = c(0, max(rf_top10$perm_importance) * 1.15)) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank()
+  )
+
+
+```
+
+# Model Evaluation
+
+## Model Comparison
+
+```{r}
+# Combine model results into one table
+comparison_table <- data.frame(
+  Model = c("ARIMA", "Lasso", "Random Forest"),
+  RMSE = c(rmse_arima, rmse_lasso, rmse_rf),
+  MAE  = c(mae_arima, mae_lasso, mae_rf)
+) %>%
+  arrange(RMSE)
+
+comparison_table
+
+
+```
+
+```{r}
+# Build prediction datasets for each model
+lasso_pred_df <- test_data %>%
+  select(store_id, week_start, actual = weekly_bottles) %>%
+  mutate(pred_lasso = as.numeric(lasso_pred))
+
+rf_pred_df <- test_data %>%
+  select(store_id, week_start, actual = weekly_bottles) %>%
+  mutate(pred_rf = as.numeric(rf_pred))
+
+# Combine all predictions
+all_preds <- test_data %>%
+  select(store_id, week_start, actual = weekly_bottles) %>%
+  left_join(
+    arima_results %>% select(store_id, week_start, pred_arima),
+    by = c("store_id", "week_start")
+  ) %>%
+  left_join(
+    lasso_pred_df %>% select(store_id, week_start, pred_lasso),
+    by = c("store_id", "week_start")
+  ) %>%
+  left_join(
+    rf_pred_df %>% select(store_id, week_start, pred_rf),
+    by = c("store_id", "week_start")
+  )
+
+head(all_preds)
+
+```
+
+```{r}
+
+
+# Aggregate to weekly totals for plotting
+plot_df <- all_preds %>%
+  group_by(week_start) %>%
+  summarise(
+    actual = sum(actual, na.rm = TRUE),
+    arima = sum(pred_arima, na.rm = TRUE),
+    lasso = sum(pred_lasso, na.rm = TRUE),
+    rf = sum(pred_rf, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-week_start, names_to = "series", values_to = "value")
+
+ggplot(plot_df, aes(x = week_start, y = value, color = series)) +
+  geom_line() +
+  labs(
+    title = "Figure 4: Actual vs Predicted Weekly Demand in 2025",
+    x = "Week",
+    y = "Total Weekly Bottles"
+  ) +
+  theme_minimal()
+
+```
+
+## Robustness Check: Reduced Macro Set
+
+```{r}
+# Build x matrices with a smaller macro set
+x_train_small <- model.matrix(
+  weekly_bottles ~ store_type + month + week_of_year + is_holiday +
+    demand_lag1 + demand_lag2 + demand_lag4 + demand_lag12 + rolling_mean_4 +
+    cpiaucsl + iaur + payems + umcsent + unrate,
+  data = train_data
+)[, -1]
+
+x_test_small <- model.matrix(
+  weekly_bottles ~ store_type + month + week_of_year + is_holiday +
+    demand_lag1 + demand_lag2 + demand_lag4 + demand_lag12 + rolling_mean_4 +
+    cpiaucsl + iaur + payems + umcsent + unrate,
+  data = test_data
+)[, -1]
+
+# Fit reduced-macro Lasso
+set.seed(123)
+
+cv_lasso_small <- cv.glmnet(
+  x_train_small,
+  y_train,
+  alpha = 1
+)
+
+best_lam_lasso_small <- cv_lasso_small$lambda.min
+best_lam_lasso_small
+
+lasso_small_fit <- glmnet(
+  x_train_small,
+  y_train,
+  alpha = 1,
+  lambda = best_lam_lasso_small
+)
+
+lasso_small_pred <- predict(
+  lasso_small_fit,
+  s = best_lam_lasso_small,
+  newx = x_test_small
+)
+
+# Evaluation
+rmse_lasso_small <- sqrt(mean((y_test - lasso_small_pred)^2))
+mae_lasso_small  <- mean(abs(y_test - lasso_small_pred))
+
+rmse_lasso_small
+mae_lasso_small
+
+```
+
+
+```{r}
+# Compare main Lasso vs reduced-macro Lasso
+robustness_table <- data.frame(
+  Model = c("Main Lasso", "Reduced-macro Lasso"),
+  RMSE = c(rmse_lasso, rmse_lasso_small),
+  MAE  = c(mae_lasso, mae_lasso_small)
+)
+
+robustness_table
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
